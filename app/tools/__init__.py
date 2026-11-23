@@ -4,10 +4,15 @@ from app.tools.calendar_tools import (  # noqa: F401
     CreateScheduleTool,
     DeleteScheduleTool,
     QuerySchedulesTool,
+    RescheduleScheduleTool,
 )
 from app.tools.doc_tools import SearchDocumentsTool  # noqa: F401
 from app.tools.leave_tools import ApplyLeaveTool  # noqa: F401
-from app.tools.todo_tools import CreateTodoTool, QueryTodosTool  # noqa: F401
+from app.tools.todo_tools import (  # noqa: F401
+    CreateTodoTool,
+    DeleteTodoTool,
+    QueryTodosTool,
+)
 
 
 def load_tools() -> None:

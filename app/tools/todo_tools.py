@@ -4,7 +4,7 @@ from __future__ import annotations
 from app.models import repository
 from app.tools.base import BaseTool, success_payload
 from app.tools.registry import register_tool
-from app.tools.schemas import CreateTodoArgs, QueryTodosArgs
+from app.tools.schemas import CreateTodoArgs, DeleteTodoArgs, QueryTodosArgs
 from app.utils.validators import parse_optional_datetime
 
 
@@ -68,4 +68,25 @@ class QueryTodosTool(BaseTool):
             message=f"共查询到 {len(records)} 条待办。",
             count=len(records),
             todos=records,
+        )
+
+
+@register_tool
+class DeleteTodoTool(BaseTool):
+    name = "delete_todo"
+    description = (
+        "删除一条待办（软删除，置 is_deleted=True，仅可在后台找回，前端不再展示）。"
+        "用于用户明确说‘删除/移除/取消 待办 ID:X’时。"
+        "注意：删除是原子执行动作，不会创建任何‘删除某待办’的新待办。"
+    )
+    args_model = DeleteTodoArgs
+
+    def execute(self, *, id: int, reason: str | None = None, **_) -> str:
+        record = repository.delete_todo(id, reason=reason)
+        return success_payload(
+            message=(
+                f"已软删除待办 #{record['id']}：{record['title']}"
+                "（仅可在后台找回，前端不再展示；未创建任何新待办）"
+            ),
+            todo=record,
         )

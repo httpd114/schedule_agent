@@ -1,11 +1,21 @@
 """意图、候选方案与规则抽取的 Pydantic 模型。"""
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.planning.rules import BusinessRule
+
+
+class ActionType(str, Enum):
+    """Bug6：动作类型枚举，Intent 节点最前面识别，删除动作绝不进 create_todo 链路。"""
+
+    QUERY = "query"
+    CREATE = "create"
+    UPDATE = "update"
+    DELETE = "delete"
 
 IntentType = Literal[
     "query_schedule", "query_todo", "query_leave",
@@ -27,6 +37,14 @@ class IntentModel(ModelBase):
         description="语义子类型，决定时间原文路由到哪个提取器",
     )
     summary: str = Field(description="对用户意图的一句话概括")
+    action_type: ActionType = Field(
+        default=ActionType.CREATE,
+        description="动作类型：query/create/update/delete；删除类由 Intent 节点确定性识别",
+    )
+    target: Literal["todo", "schedule", "none"] = Field(
+        default="none", description="动作作用对象：delete 时必填 todo 或 schedule"
+    )
+    target_id: int | None = Field(default=None, description="delete 动作的目标记录 ID")
     time_expressions: dict[str, str] = Field(
         default_factory=dict,
         description=(
@@ -49,7 +67,8 @@ class IntentModel(ModelBase):
 class PlanStepModel(ModelBase):
     tool: Literal[
         "create_schedule", "query_schedules", "create_todo", "query_todos",
-        "search_documents", "delete_schedule", "apply_leave", "check_room_occupancy",
+        "search_documents", "delete_schedule", "delete_todo", "reschedule_schedule",
+        "apply_leave", "check_room_occupancy",
     ] = Field(description="要调用的工具名")
     args: dict[str, Any] = Field(default_factory=dict, description="工具参数对象")
 

@@ -11,6 +11,7 @@ from app.tools.schemas import (
     CreateScheduleArgs,
     DeleteScheduleArgs,
     QuerySchedulesArgs,
+    RescheduleScheduleArgs,
 )
 from app.utils.validators import parse_datetime
 
@@ -139,4 +140,62 @@ class DeleteScheduleTool(BaseTool):
         return success_payload(
             message=f"已取消日程 #{record['id']}：{record['title']}（软删除，可回溯）",
             schedule=record,
+        )
+
+
+@register_tool
+class RescheduleScheduleTool(BaseTool):
+    name = "reschedule_schedule"
+    description = (
+        "改期专用工具：把一条已有日程改到新时间。"
+        "在原子事务内新建日程并软删除原日程，可回溯。"
+        "schedule_id 为原日程 ID；start_time/end_time 由约束求解器在目标时段内选出；"
+        "target_date/period_prefer/room_prefer 记录用户的模糊时段偏好。"
+    )
+    args_model = RescheduleScheduleArgs
+
+    def execute(
+        self, *, schedule_id: int, target_date: str | None = None,
+        period_prefer: str | None = None, room_prefer: str | None = None,
+        start_time: str | None = None, end_time: str | None = None, **_
+    ) -> str:
+        if not start_time:
+            raise ToolExecutionError(
+                "MISSING_TARGET_TIME",
+                "改期缺少新开始时间：请先由约束求解器在目标时段内选出具体时段。",
+                "调用前应在目标日期的时段区间内用 CSP 求解 start_time/end_time。",
+            )
+        original = repository.get_schedule(int(schedule_id))
+        if original is None:
+            raise ToolExecutionError(
+                "SCHEDULE_NOT_FOUND", f"原日程 #{schedule_id} 不存在", "请核对日程 ID。"
+            )
+        if str(original.get("status")) == "cancelled":
+            raise ToolExecutionError(
+                "SCHEDULE_CANCELLED", f"原日程 #{schedule_id} 已取消，不能重复改期", "请核对日程 ID。"
+            )
+        start = parse_datetime(start_time, "start_time")
+        end = parse_datetime(end_time, "end_time") if end_time else start + timedelta(hours=1)
+        if end <= start:
+            raise ToolExecutionError(
+                "INVALID_TIME_RANGE", "新结束时间必须晚于开始时间", "请重新选择时段。"
+            )
+        result = repository.reschedule_schedule(
+            int(schedule_id),
+            title=original["title"],
+            start_time=start,
+            end_time=end,
+            location=room_prefer or original.get("location"),
+            description=original.get("description"),
+            attendees=original.get("attendees"),
+        )
+        return success_payload(
+            message=(
+                f"已将日程 #{schedule_id}「{original['title']}」改到 "
+                f"{result['new']['start_time']}"
+                + (f"（{period_prefer}，会议室 {room_prefer}）" if period_prefer and room_prefer else "")
+                + "；原日程已软删除，可回溯"
+            ),
+            new_schedule=result["new"],
+            original=result["original"],
         )

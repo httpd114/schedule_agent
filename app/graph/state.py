@@ -66,6 +66,9 @@ class AgentState(TypedDict):
     user_intent: UserIntent
     context_window: ContextWindow
     target_time: TargetTime
+    # ug1：模糊时段偏好 {type: prefer, date, period, room_prefer} 或 None
+    # 存在时 create/reschedule 走 CSP 时段检索 + HITL，不做精确时间校验
+    time_prefer: dict | None
     context_bundle: ContextBundle
     candidate_plans: list[dict]
     selected_plan: dict | None

@@ -15,6 +15,7 @@ from typing import Any
 from constraint import Problem
 
 from app.planning.rules import BusinessRule
+from app.utils.time_periods import PERIOD_BOUNDS
 from app.utils.validators import parse_datetime
 
 DEFAULT_ROOMS = ["12F-A301", "15F-B205", "10F-B102", "16F-C301", "8F-A101"]
@@ -276,22 +277,40 @@ def suggest_windows(
     step_minutes: int = 30,
     rooms: list[str] | None = None,
     now: datetime | None = None,
+    period: str | None = None,
+    prefer_room: str | None = None,
+    only_day: bool = False,
 ) -> list[dict]:
-    """用 CSP 枚举可行起点，返回 Top3【具体时段 + 可用会议室】。"""
+    """用 CSP 枚举可行起点，返回 Top3【具体时段 + 可用会议室】。
+
+    ug1：period 给定时只在「上午/下午/晚上」区间内枚举；only_day=True 时
+    仅检索 desired 当天（模糊时段“改到27号下午”不应跑到别的日子）。
+    prefer_room 为首选会议室，排在候选池最前，冲突时仍由求解器换房。
+    """
     desired = (
         parse_datetime(desired_start, "desired_start")
         if isinstance(desired_start, str)
         else desired_start
     )
     room_pool = [str(room) for room in (rooms or DEFAULT_ROOMS) if str(room).strip()]
+    if prefer_room:
+        room_pool = [str(prefer_room)] + [room for room in room_pool if room != str(prefer_room)]
     pattern = _room_pattern(rules)
     if pattern:
         room_pool = [room for room in room_pool if re.match(pattern, room)] or room_pool
 
+    # 时段区间：period 优先，否则全天工作时段
+    if period:
+        lower_h, upper_h = PERIOD_BOUNDS.get(period, (9, 18))
+        minute_range = range(lower_h * 60, upper_h * 60 - duration_minutes + 1, step_minutes)
+    else:
+        minute_range = range(9 * 60, 18 * 60 - duration_minutes + 1, step_minutes)
+
     domain: list[datetime] = []
-    for day_offset in range(-1, span_days + 1):
+    day_offsets = (0,) if only_day else range(-1, span_days + 1)
+    for day_offset in day_offsets:
         day = desired.date() + timedelta(days=day_offset)
-        for minutes in range(9 * 60, 18 * 60 - duration_minutes + 1, step_minutes):
+        for minutes in minute_range:
             domain.append(datetime(day.year, day.month, day.day) + timedelta(minutes=minutes))
     if not domain:
         return []

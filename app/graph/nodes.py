@@ -22,7 +22,7 @@ from app.planning.constraint_solver import (
     suggest_windows,
 )
 from app.planning.llm_json import parse_llm_json
-from app.planning.plan_models import IntentModel, PlanSet, RuleSet
+from app.planning.plan_models import ActionType, IntentModel, PlanSet, RuleSet
 from app.planning.rules import BusinessRule, compact_baseline, compact_rules, split_rules
 from app.planning.templates import build_templates, template_hint
 from app.rag import pipeline
@@ -30,7 +30,7 @@ from app.services.context_service import aggregate_context
 from app.tools.base import structured_error
 from app.tools.registry import call_tool, get_tool
 from app.tools.schemas import sanitize_args
-from app.utils.nl_time import parse_nl_time
+from app.utils.nl_time import _parse_period_prefer, parse_nl_time
 from app.utils.validators import parse_datetime
 from config import settings
 
@@ -54,6 +54,59 @@ _QUERY_TIME_PATTERN = re.compile(
     r"大后天|后天|明天|明日|今天|今日|下下?周[一二三四五六日天]"
     r"|本?周[一二三四五六日天]|\d{1,2}月\d{1,2}[号日]|\d{4}-\d{1,2}-\d{1,2}"
 )
+
+
+# Bug6：删除动作确定性识别关键词。命中“删除/移除/取消 + ID”即判 DELETE，
+# 绝不进入 create_todo 链路（否则会生成“删除整理技术文档”这样的新待办）。
+_DELETE_KEYWORDS = ("删除", "移除", "取消", "干掉", "删掉")
+_TODO_WORDS = ("待办", "任务", "todo", "事项")
+_SCHEDULE_WORDS = ("日程", "会议", "安排", "评审", "周会")
+# 根治：只认显式 ID:数字 / ID：数字 / 编号:数字，不再用裸数字兜底，
+# 否则“11月27日删除待办”会把日期里的 27 误当成 ID。
+_DELETE_ID_RE = re.compile(r"(?:ID|id|编号|序号)\s*[:：#]?\s*(\d+)")
+
+
+def parse_delete_command(user_input: str) -> dict:
+    """按用户推荐方案，用独立正则提取删除命令的 ID 与目标类型。
+
+    返回结构：
+    - 命中：{"action": ActionType.DELETE, "target_id": int, "target_type": "todo"|"schedule"}
+    - 未命中：{"action": None, "target_id": None, "target_type": None}
+
+    完全不依赖 TARGET_KEYS 或任何时间抽取循环，适配带备注的长文本。
+    """
+    value = str(user_input or "")
+    match = _DELETE_ID_RE.search(value)
+    if not match:
+        return {"action": None, "target_id": None, "target_type": None}
+    target_id = int(match.group(1))
+    lowered = value.lower()
+    if "待办" in value or "todo" in lowered or any(w in value for w in _TODO_WORDS):
+        target_type = "todo"
+    elif "日程" in value or "会议" in value or any(w in value for w in _SCHEDULE_WORDS):
+        target_type = "schedule"
+    else:
+        # 默认待办：与用户推荐写法一致（“删除整理技术文档 ID:2”没有显式类型词）
+        target_type = "todo"
+    return {"action": ActionType.DELETE, "target_id": target_id, "target_type": target_type}
+
+
+def _detect_delete_action(text: str) -> dict | None:
+    """Intent 节点最前面调用：命中“删除关键词 + 显式 ID”才判 DELETE。"""
+    value = str(text or "")
+    if not any(word in value for word in _DELETE_KEYWORDS):
+        return None
+    # 排除“取消会议改到X / 调整到下午”这类改期语义，避免误伤改期流程
+    if any(word in value for word in ("改期", "调整到", "改到", "换到", "移到", "推迟到")):
+        return None
+    parsed = parse_delete_command(value)
+    if parsed["action"] != ActionType.DELETE:
+        return None
+    return {
+        "action_type": "delete",
+        "target": parsed["target_type"],
+        "target_id": parsed["target_id"],
+    }
 
 
 def _scan_query_time(text: str) -> dict | None:
@@ -175,6 +228,45 @@ def _cost_rank(cost: str) -> int:
 def intent_node(state: dict) -> dict:
     """意图识别 + 按语义分流提取时间：context_window 与 target_time 彻底分离。"""
     user_input = state["user_input"]
+
+    # Bug6：最前面确定性识别删除动作，命中即短路，绝不进入 create_todo 链路。
+    delete_action = _detect_delete_action(user_input)
+    if delete_action is not None:
+        is_schedule = delete_action["target"] == "schedule"
+        return {
+            "user_intent": {
+                "raw": user_input,
+                "category": "delete",
+                "intent_type": "delete_schedule" if is_schedule else "delete_todo",
+                "summary": f"删除{'日程' if is_schedule else '待办'} ID:{delete_action['target_id']}",
+                "action_type": "delete",
+                "target": delete_action["target"],
+                "target_id": delete_action["target_id"],
+                "time_expressions": {},
+                "risk_level": "high",
+                "needs_rag": False,
+            },
+            "context_window": {"start": None, "end": None},
+            # 删除动作不解析任何业务时间，直接给空字典；
+            # 根治 NameError：这里绝不再引用未导入的 TARGET_KEYS。
+            "target_time": {},
+            "time_prefer": None,
+            "needs_rag": False,
+            "route": "delete",
+            "messages": list(state.get("messages", [])) + [{"role": "user", "content": user_input}],
+            "plan_decision": "pending",
+            "tool_traces": [],
+            "feedback": [],
+            "alternatives": [],
+            "conflict_rounds": 0,
+            "iteration": 0,
+            "pending_steps": [],
+            "retry_attempt": 0,
+            "degraded": False,
+            "degraded_question": "",
+            "degraded_confirmed": False,
+        }
+
     message = get_llm().chat(
         [
             {
@@ -206,6 +298,14 @@ time_expressions 必须按业务语义选键，值只填用户说的原文，不
     model = parse_llm_json(message["content"], IntentModel, _fallback_intent(user_input))
     parsed = parse_nl_time(model.time_expressions or {}, model.intent_type, now=datetime.now())
     context_window, target_time = parsed.to_state()
+    time_prefer = parsed.period_prefer
+    # 确定性兜底：LLM 没把模糊时段放进 time_expressions 时，从原文补一次扫描
+    if time_prefer is None and model.intent_type in {"create_schedule", "reschedule", "plan"}:
+        prefer_hit = _parse_period_prefer(
+            user_input, now=datetime.now(), base_date=datetime.now().date(), target_key="schedule_start"
+        )
+        if prefer_hit is not None:
+            time_prefer = prefer_hit
 
     # 确定性兜底：查询类若 LLM 漏提时间，从原文扫描“明天”等相对时间生成查询窗口。
     # 这一步不依赖模型稳定性，确保“明天有哪些待办”一定按 11-24 窗口筛选。
@@ -248,6 +348,7 @@ time_expressions 必须按业务语义选键，值只填用户说的原文，不
         "user_intent": intent,
         "context_window": context_window,
         "target_time": target_time,
+        "time_prefer": time_prefer,
         "needs_rag": bool(needs_rag),
         "route": "admin" if model.category == "admin" else "context",
         "messages": list(state.get("messages", [])) + [{"role": "user", "content": user_input}],
@@ -385,7 +486,10 @@ def planner_node(state: dict) -> dict:
         extra = "\n用户反馈（必须据此重新规划）：" + "；".join(feedback[-3:])
 
     # 模板库直接给出具体时段与低扰动折中方案，避免 LLM 只给极端方案
-    plans = build_templates(intent, bundle, hard)
+    # ug1：把模糊时段偏好注入 intent，供模板按日期+时段区间做 CSP 检索
+    template_intent = dict(intent)
+    template_intent["time_prefer"] = state.get("time_prefer")
+    plans = build_templates(template_intent, bundle, hard)
     if plans:
         return {
             "candidate_plans": plans,
@@ -603,6 +707,64 @@ def confirm_node(state: dict) -> dict:
     return {"plan_decision": "approved", "selected_plan": chosen, "route": "execute"}
 
 
+def delete_confirm_node(state: dict) -> dict:
+    """Bug6：删除动作的独立 HITL 确认弹窗。确认后只做软删除，不新增任何待办。"""
+    intent = state["user_intent"]
+    is_schedule = intent.get("intent_type") == "delete_schedule"
+    target_label = "日程" if is_schedule else "待办"
+    object_name = f"{target_label} ID:{intent.get('target_id')}"
+    question = (
+        f"是否确认删除{object_name}，删除后仅可在后台找回，前端不再展示？"
+    )
+    decisions = interrupt(
+        {
+            "kind": "delete_confirm",
+            "question": question,
+            "plans": [
+                {
+                    "id": "A",
+                    "title": f"确认删除{object_name}",
+                    "description": "软删除：仅标记删除位，不新增任何待办或日程记录；可在后台找回。",
+                    "steps": [],
+                    "risks": ["删除后前端不再展示", "仅可在后台找回"],
+                    "cost": "low",
+                    "recommended": True,
+                }
+            ],
+            "selected_plan_id": "A",
+            "summary": intent.get("summary"),
+            "baseline_notes": [],
+        }
+    )
+    if isinstance(decisions, dict):
+        action = str(decisions.get("action", "approve")).lower()
+    else:
+        action = str(decisions).lower()
+
+    if action in {"reject", "cancel", "取消"}:
+        return {
+            "plan_decision": "rejected",
+            "final_answer": f"已取消删除操作，未对{object_name}做任何改动。",
+            "route": "respond",
+        }
+
+    tool_name = "delete_schedule" if is_schedule else "delete_todo"
+    delete_args = (
+        {"id": int(intent["target_id"]), "reason": "用户确认删除"}
+    )
+    plan = {
+        "id": "A",
+        "title": f"删除{target_label} ID:{intent['target_id']}",
+        "steps": [{"tool": tool_name, "args": delete_args}],
+        "needs_confirmation": False,
+    }
+    return {
+        "plan_decision": "approved",
+        "selected_plan": plan,
+        "route": "execute",
+    }
+
+
 def _atomic_reschedule(plan: dict, traces: list[dict]) -> bool:
     """改期原子方案：新建 + 软删除原日程在同一事务完成。返回是否成功。"""
     original_id = plan.get("reschedule_of")
@@ -776,6 +938,23 @@ def degraded_confirm_node(state: dict) -> dict:
 _PRIORITY_LABEL = {"high": "高", "medium": "中等", "low": "低"}
 
 
+def _dedup_todos(items: list[dict]) -> list[dict]:
+    """ug7：按 todo.id 去重，同一待办只保留一条；无 id 时用 (标题, 截止) 兜底。"""
+    seen: set[tuple] = set()
+    result: list[dict] = []
+    for item in items or []:
+        key = (
+            ("id", item["id"])
+            if item.get("id") is not None
+            else ("anon", str(item.get("title")), str(item.get("due_time")))
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
 def _delay_guidance(bundle: dict, hard: list[BusinessRule]) -> str:
     """双维度提示：用户业务优先级 + 制度时限，风险交给用户，不直接判定可延后。
 
@@ -785,8 +964,19 @@ def _delay_guidance(bundle: dict, hard: list[BusinessRule]) -> str:
     lines: list[str] = []
     # 数据源固定为全局未完成待办；兼容旧调用方仅传 todos 的情形
     todos = bundle.get("pending_todos") or bundle.get("todos", [])
+    # ug7：以 todo.id 为唯一 key 去重，同一个待办只渲染一次【可权衡延后】卡片；
+    # 无 id 时用 (标题, 截止时间) 兜底，避免重复数据导致卡片重复渲染。
+    seen_keys: set[tuple] = set()
     # 只看日期临近的未完成待办；纪要/报销等受制度硬约束的任务即使中等优先级也要提示
     for todo in todos:
+        key = (
+            ("id", todo["id"])
+            if todo.get("id") is not None
+            else ("anon", str(todo.get("title")), str(todo.get("due_time")))
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
         if not todo.get("due_time") or todo.get("time_status") == "overdue":
             continue
         days_left = todo.get("days_left")
@@ -852,8 +1042,8 @@ def _deadline_section(bundle: dict, hard: list[BusinessRule], include_later: boo
     include_later 默认关闭：「后续到期（供参考，非临近截止）」不是告警信息，
     只在用户明确要看全部/后续待办清单时才展示，避免每条回答都出现。
     """
-    near = bundle.get("near_deadline_todos", [])
-    pending = bundle.get("pending_todos", [])
+    near = _dedup_todos(bundle.get("near_deadline_todos", []))
+    pending = _dedup_todos(bundle.get("pending_todos", []))
     lines: list[str] = ["### 临近截止任务"]
 
     def remaining(item: dict) -> str:

@@ -128,6 +128,20 @@ def create_todo(*, title: str, **kwargs) -> dict:
         return item.to_dict()
 
 
+def delete_todo(todo_id: int, reason: str | None = None) -> dict:
+    """Bug6：软删除待办，仅置 is_deleted=True；绝不新增任何待办记录。"""
+    with SessionLocal() as session:
+        item = session.get(Todo, int(todo_id))
+        if item is None:
+            raise ValueError(f"待办 #{todo_id} 不存在")
+        item.is_deleted = True
+        note = f"[删除] {reason}" if reason else "[删除]"
+        item.description = f"{item.description or ''}\n{note}".strip()
+        session.commit()
+        session.refresh(item)
+        return item.to_dict()
+
+
 def list_todos(
     *,
     keyword: str | None = None,
@@ -135,9 +149,13 @@ def list_todos(
     due_before: datetime | None = None,
     due_after: datetime | None = None,
     limit: int = 20,
+    include_deleted: bool = False,
 ) -> list[dict]:
+    """默认过滤软删除待办：前端列表与全局未完成集合都不再展示已删除项。"""
     with SessionLocal() as session:
         stmt = select(Todo)
+        if not include_deleted:
+            stmt = stmt.where(Todo.is_deleted.is_(False))
         if keyword:
             stmt = stmt.where(Todo.title.contains(keyword))
         if status:

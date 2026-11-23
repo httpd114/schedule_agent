@@ -8,6 +8,10 @@
 
 对外入口：``parse_nl_time(text, intent_type)``，其中 text 可为单个表达或
 {语义键: 原文} 字典。返回结构化 datetime，调用方再转成 ISO 写入 State。
+
+ug1：当业务时间是「11月27日下午」这类**模糊时段**（只有日期 + 时段词、
+没有具体时钟）时，不再强行补时间导致 ValidationError，而是产出 prefer
+结构 {type: prefer, date, period, room_prefer}，交给 CSP 在时段区间内求解。
 """
 from __future__ import annotations
 
@@ -16,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
+from app.utils.time_periods import as_prefer, extract_room, is_period_only, period_of, strip_period
 from app.utils.validators import ValidationError, _parse_clock, parse_datetime
 
 # target_time 的合法键（leave_end 为请假区间的结束，属于扩展字段）
@@ -65,6 +70,8 @@ class TimeParseResult:
     )
     raw_hits: dict[str, str] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    # ug1：模糊时段偏好（mode B），成功解析时 target_time 对应键保持 None
+    period_prefer: dict[str, Any] | None = None
 
     def to_state(self) -> tuple[dict[str, str | None], dict[str, str | None]]:
         """转成可安全放进 LangGraph State 的 ISO 字符串（绝不外泄原文）。"""
@@ -187,6 +194,43 @@ def _resolve_points(
     return start, end
 
 
+def _parse_period_prefer(
+    raw: str,
+    *,
+    now: datetime,
+    base_date,
+    target_key: str,
+) -> dict[str, Any] | None:
+    """解析「11月27日下午」「明晚」「下周四上午」这类模糊时段。
+
+    只处理目标业务时间键（schedule_start / schedule_end / reschedule 场景），
+    且必须是「日期 + 时段词、无具体时钟」。会议室优先信息从原文一并抽取。
+    """
+    text = _PREFIX_RE.sub("", str(raw or "").strip())
+    if not is_period_only(text):
+        return None
+    period = period_of(text)
+    if period is None:
+        return None
+
+    date_part = strip_period(text)
+    day = None
+    if date_part:
+        # 去掉时段词后，剩余部分应当是纯日期表达；用 _parse_point 解析日期，
+        # default_hour=0 让它落在当天零点，避免被时段词的默认小时干扰。
+        try:
+            parsed_day = _parse_point(date_part, base_date, now, default_hour=0)
+            if parsed_day is not None:
+                day = parsed_day.date()
+        except ValidationError:
+            day = None
+    if day is None:
+        day = base_date  # 只有“下午”没有日期时，按今天处理
+
+    room = extract_room(str(raw or ""))
+    return as_prefer(day, period, room)
+
+
 def _infer_window(
     target: dict[str, datetime | None], now: datetime
 ) -> tuple[datetime | None, datetime | None]:
@@ -252,6 +296,20 @@ def parse_nl_time(
 
         if key not in TARGET_KEYS:
             continue
+
+        # ug1：日程类业务时间若是「日期 + 上午/下午/晚上」模糊时段，
+        # 产出 prefer 交给 CSP 检索，不再抛 ValidationError。
+        if key in {"schedule_start", "schedule_end"} and intent_type in {
+            "create_schedule", "reschedule", "plan", "change",
+        }:
+            prefer = _parse_period_prefer(
+                str(raw), now=now, base_date=base, target_key=key
+            )
+            if prefer is not None:
+                result.period_prefer = prefer
+                # 模糊时段不写精确 target_time，避免下游 Pydantic 校验误判
+                continue
+
         hour = 18 if key in {"todo_deadline", "schedule_end"} else 9
         start, end = _resolve_points(str(raw), base, now, default_hour=hour)
         if start:

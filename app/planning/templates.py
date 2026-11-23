@@ -15,6 +15,7 @@ from app.planning.constraint_solver import (
     suggest_windows,
 )
 from app.planning.rules import BusinessRule
+from app.utils.time_periods import PERIOD_BOUNDS, is_prefer
 from app.utils.validators import parse_datetime
 
 
@@ -214,6 +215,82 @@ def _leave_plans(intent: dict, bundle: dict, rules: list[BusinessRule]) -> list[
     ]
 
 
+def _period_reschedule_plans(intent: dict, bundle: dict, rules: list[BusinessRule]) -> list[dict] | None:
+    """ug1：模糊时段改期（如“改到11月27日下午，会议室优先12F-A301”）。
+
+    日期 + 时段区间约束交给 CSP，在**当天该时段内**求 Top3 空闲时段，
+    每个方案通过独立 reschedule_schedule 工具原子完成（新建 + 软删除原日程）。
+    """
+    prefer = intent.get("time_prefer")
+    if not is_prefer(prefer):
+        return None
+    summary = str(intent.get("summary", "")) + str(intent.get("raw", ""))
+    if not any(word in summary for word in ("改期", "调整到", "推迟", "提前到", "换到", "改到", "移到")):
+        return None
+
+    original = None
+    for item in bundle.get("schedules", []):
+        title = str(item.get("title") or "")
+        if title and any(ch in summary for ch in title):
+            original = item
+            break
+    if not original or not original.get("id"):
+        # 没在窗口里按标题匹配到原日程时，退而求其次取第一条有效日程
+        original = next((item for item in bundle.get("schedules", []) if item.get("id")), None)
+    if not original or not original.get("id"):
+        return None
+
+    try:
+        original_start = parse_datetime(original["start_time"], "start_time")
+        original_end = parse_datetime(original["end_time"], "end_time") if original.get("end_time") else original_start + timedelta(hours=1)
+        duration = max(30, min(180, int((original_end - original_start).total_seconds() // 60)))
+    except Exception:  # noqa: BLE001
+        duration = 60
+
+    day = prefer["date"]
+    period = prefer.get("period") or "afternoon"
+    room = prefer.get("room_prefer") or _preferred_location(intent)
+    lower_h, upper_h = PERIOD_BOUNDS.get(period, (13, 18))
+    anchor = f"{day}T{lower_h:02d}:00:00"
+    alternatives = suggest_windows(
+        anchor, duration, bundle, rules, top_k=3,
+        period=period, only_day=True, rooms=_room_pool(intent), prefer_room=room,
+    )
+    if not alternatives:
+        return None
+
+    plans = []
+    for index, alt in enumerate(alternatives, 1):
+        rotated = alternatives[index - 1:] + alternatives[:index - 1]
+        plans.append(
+            {
+                "id": chr(64 + index),
+                "title": f"{original['title']} · {period}改期备选 {index}",
+                "description": f"在 {day} {lower_h:02d}:00-{upper_h:02d}:00 内由约束求解器选出的空闲时段；"
+                               "确认后用独立改期工具在原子事务里新建日程并软删除原日程。",
+                "steps": [
+                    {
+                        "tool": "reschedule_schedule",
+                        "args": {
+                            "schedule_id": original["id"],
+                            "target_date": day,
+                            "period_prefer": period,
+                            "room_prefer": alt.get("location") or room,
+                            "start_time": alt["start_time"],
+                            "end_time": alt["end_time"],
+                        },
+                    }
+                ],
+                "risks": ["需通知参与人新时间", "原日程会变为已取消状态，可回溯"],
+                "cost": "low" if index == 1 else ("medium" if index == 2 else "high"),
+                "start_time": alt["start_time"],
+                "end_time": alt["end_time"],
+                "recommendation": format_recommendation(alt, rotated),
+            }
+        )
+    return plans
+
+
 def _reschedule_plans(intent: dict, bundle: dict, rules: list[BusinessRule]) -> list[dict] | None:
     summary = str(intent.get("summary", "")) + str(intent.get("raw", ""))
     if not any(word in summary for word in ("改期", "调整到", "推迟", "提前到", "换到")):
@@ -275,10 +352,26 @@ def _reschedule_plans(intent: dict, bundle: dict, rules: list[BusinessRule]) -> 
 def _time_window_plans(intent: dict, bundle: dict, rules: list[BusinessRule]) -> list[dict] | None:
     target = intent.get("target_time") or {}
     has_time = target.get("schedule_start") or intent.get("time_hint")
-    if intent.get("category") not in {"create", "plan"} or not has_time:
+    prefer = intent.get("time_prefer")
+    has_prefer = is_prefer(prefer)
+    if intent.get("category") not in {"create", "plan"} or not (has_time or has_prefer):
         return None
-    start_raw, duration = _window_source(intent, bundle, datetime.now())
-    alternatives = suggest_windows(start_raw, duration, bundle, rules, top_k=3, span_days=5, rooms=_room_pool(intent))
+
+    if has_prefer:
+        lower_h, upper_h = PERIOD_BOUNDS.get(prefer.get("period", "afternoon"), (13, 18))
+        anchor = f"{prefer['date']}T{lower_h:02d}:00:00"
+        duration = 60
+        match = re.search(r"(\d+(?:\.\d+)?)\s*(?:小时|个小时|h\b)", f"{intent.get('raw', '')} {intent.get('summary', '')}")
+        if match:
+            duration = max(15, min(240, int(float(match.group(1)) * 60)))
+        alternatives = suggest_windows(
+            anchor, duration, bundle, rules, top_k=3,
+            period=prefer.get("period"), only_day=True,
+            rooms=_room_pool(intent), prefer_room=prefer.get("room_prefer"),
+        )
+    else:
+        start_raw, duration = _window_source(intent, bundle, datetime.now())
+        alternatives = suggest_windows(start_raw, duration, bundle, rules, top_k=3, span_days=5, rooms=_room_pool(intent))
     if not alternatives:
         return None
     title = str(intent.get("summary") or "新日程")[:40]
@@ -328,7 +421,10 @@ def _time_window_plans(intent: dict, bundle: dict, rules: list[BusinessRule]) ->
 
 def build_templates(intent: dict, bundle: dict, rules: list[BusinessRule]) -> list[dict] | None:
     """命中模板则返回确定性方案（已含 Top3 时段/会议室），否则返回 None 交给 LLM。"""
-    for builder in (_meeting_absence_plans, _leave_plans, _reschedule_plans, _time_window_plans):
+    for builder in (
+        _period_reschedule_plans, _meeting_absence_plans, _leave_plans,
+        _reschedule_plans, _time_window_plans,
+    ):
         plans = builder(intent, bundle, rules)
         if plans:
             return plans

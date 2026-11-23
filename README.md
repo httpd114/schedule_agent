@@ -12,8 +12,10 @@
 | **Planner 模板库** | `app/planning/templates.py` | 命中场景直接给确定性方案：无法参加周会 → 找人代参会+同步纪要 / 请假+交接 / 会议改期，按代价升序；时间类调用 CSP 输出 Top3 **具体时段 + 可用会议室** |
 | **RAG 按需触发** | `app/graph/workflow.py` 的 `_rag_route` | 普通“查日程/查待办”跳过文档检索；主动问制度、创建/变更/规划类才检索并抽硬约束 |
 | **工具重试与降级** | `app/graph/nodes.py` 的 `retry_node`、`degraded_confirm_node` | 工具 error 进入重试子节点，最多 2 次，自动归一化 ISO 时间、剔除多余 key；仍失败则 HITL 二次强确认，防止盲写 DB |
-| **原子改期** | `app/models/repository.py`、`app/tools/calendar_tools.py` | 新增 `delete_schedule`（软删除可回溯）；改期方案在**同一事务**内新建日程 + 取消原日程，确认后自动执行 |
-| **延后双维度提示** | `app/graph/nodes.py` 的 `_delay_guidance` | 输出【可权衡延后】模板：业务优先级、制度宽限窗口、风险提示分开展示，不直接判定“可以延后”；数据源为全局未完成待办，与查询窗口无关 |
+| **原子改期** | `app/models/repository.py`、`app/tools/calendar_tools.py` | `delete_schedule`（软删除可回溯）+ 独立 `reschedule_schedule` 工具；改期在**同一事务**内新建日程 + 取消原日程，确认后自动执行 |
+| **模糊时段偏好（CSP 检索）** | `app/utils/time_periods.py`、`app/utils/nl_time.py`、`app/planning/templates.py` | “改到 11月27日下午、会议室优先 12F-A301” 不再抛 ValidationError：`parse_nl_time` 产出 `prefer` 结构（date/period/room_prefer），把日期+时段区间（morning 08–12 / afternoon 13–18 / evening 18–21）+偏好会议室交给 CSP，返回当天该时段 Top3 空闲时段进入 HITL 选择 |
+| **删除动作确定性识别（Bug6）** | `app/graph/nodes.py` 的 `parse_delete_command`、`app/planning/plan_models.py` 的 `ActionType` | Intent 节点最前面用**独立正则**抓显式 `ID:数字`（不依赖 `TARGET_KEYS`，避免把日期数字误当 ID）；命中“删除/移除/取消 + ID”即判 `ActionType.DELETE`，走独立 `delete_confirm` HITL，确认后仅软删除（`delete_todo` / `delete_schedule`），**绝不进入 create_todo 生成“删除 xxx”待办**；查询待办默认过滤 `is_deleted=True` |
+| **延后双维度提示** | `app/graph/nodes.py` 的 `_delay_guidance` | 输出【可权衡延后】模板：业务优先级、制度宽限窗口、风险提示分开展示，不直接判定“可以延后”；数据源为全局未完成待办，与查询窗口无关；按 `todo.id` 去重，同一待办只渲染一次卡片 |
 | **待办段落按需展示** | `app/graph/nodes.py` 的 `_deadline_display`、`_deadline_section` | 「临近截止任务 / 可权衡延后」只在用户主动问到临近、截止、延后、待办等话题时附加到回答末尾；普通建日程、查日程、制度问答不再出现。「后续到期（供参考，非临近截止）」默认不展示，仅当用户明确要看全部/后续待办清单（如“列一下全部待办”）时才带出 |
 | **待办时间语义隔离** | `app/services/context_service.py`、`app/graph/nodes.py` | 待办拆成三集合：`todos`（**仅 deadline 落在窗口内**，回答“某天的待办”）、`pending_todos`（全局未完成，供延后提示）、`near_deadline_todos`（**全局独立判断**临近截止，阈值 `NEAR_DEADLINE_HOURS=24` 可配）。关联日程时间**仅展示**，绝不参与筛选/排序/告警；纪要待办 deadline 固定为会议结束 + 24h |
 | **时间语义分离** | `app/utils/nl_time.py`、`app/graph/state.py` | `context_window` 只作聚合查询窗口（完整自然日 00:00–23:59:59），由程序按业务时间推导（±1 天，查会议室仅当天）；会议/待办/请假/查会议室的业务时间进入 `target_time` 分组，**用户时间原文绝不直接进工具 Schema**；LLM 漏提“明天”时由确定性扫描兜底 |
@@ -117,17 +119,19 @@ flowchart TD
 
 ## 六、工具与结构化错误
 
-当前注册 8 个工具，每个只校验自己关心的时间字段：
+当前注册 10 个工具，每个只校验自己关心的时间字段：
 
 | 工具 | 时间字段 | 说明 |
 | --- | --- | --- |
-| `create_schedule` | `start_time` / `end_time` | 会议室用 `room_prefer` |
+| `create_schedule` | `start_time` / `end_time` | 会议室用 `room_prefer`；模糊时段走 prefer 分支，不直接校验 |
 | `query_schedules` | `context_window: {start, end}` | 程序生成的查询区间 |
 | `create_todo` | `deadline` | 内容字段为 `content`，可带 `link_schedule_id` |
-| `query_todos` | `context_window: {start, end}` | 按截止时间过滤 |
+| `query_todos` | `context_window: {start, end}` | 按截止时间过滤，默认排除已软删除待办 |
 | `apply_leave` | `leave_date` | 请假类型 `leave_type` |
 | `check_room_occupancy` | `check_datetime` | 单点时间 + `room_name` |
-| `delete_schedule` | — | 软删除，可回溯 |
+| `delete_schedule` | — | 日程软删除，可回溯 |
+| `delete_todo` | — | 待办软删除（仅置 `is_deleted=True`，不新增任何记录），可后台找回 |
+| `reschedule_schedule` | `start_time` / `end_time` | 独立改期：软删除原日程 + 新建日程原子事务；`target_date`/`period_prefer`/`room_prefer` 只记录偏好，不做时间校验 |
 | `search_documents` | — | RAG 检索 |
 
 不存在任何承接所有时间文本的 `focus_time` 字段。旧字段名（`title`/`due_time`/`location`）在 Pydantic 层通过别名兼容，重试自愈时也会映射回新字段。
@@ -168,7 +172,7 @@ schedule_agent/
 │   ├── graph/                 # 三层状态、13 个节点（含 admin）、条件边装配
 │   ├── planning/              # 模板库、规则拆分、加权打分、约束求解、LLM JSON 解析
 │   ├── services/              # 上下文聚合查询服务
-│   ├── tools/                 # Pydantic Schema、注册表、8 类工具、参数清洗
+│   ├── tools/                 # Pydantic Schema、注册表、10 类工具、参数清洗
 │   ├── models/                # SQLAlchemy 实体、仓储（软删除/原子改期）、数据库初始化
 │   ├── rag/                   # 检索器抽象、本地/向量实现
 │   ├── llm/                   # 智谱 Function Calling 客户端

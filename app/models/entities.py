@@ -59,6 +59,8 @@ class Todo(Base):
     priority: Mapped[str] = mapped_column(String(16), default="medium", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     tags: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    # Bug6：软删除标记。删除待办只置 is_deleted=True，不新增“删除 xxx”待办。
+    is_deleted: Mapped[bool] = mapped_column(default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.now, onupdate=datetime.now
@@ -74,4 +76,5 @@ class Todo(Base):
             "priority": self.priority,
             "status": self.status,
             "tags": self.tags,
+            "is_deleted": bool(self.is_deleted),
         }

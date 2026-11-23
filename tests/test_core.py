@@ -44,9 +44,11 @@ def test_parse_datetime_rejects_garbage():
 
 
 def test_registry_has_eight_tools_with_semantic_time_schemas():
+    # ug1/Bug6 新增 reschedule_schedule 与 delete_todo，共 10 个工具
     assert sorted(tool_names()) == [
         "apply_leave", "check_room_occupancy", "create_schedule", "create_todo",
-        "delete_schedule", "query_schedules", "query_todos", "search_documents",
+        "delete_schedule", "delete_todo", "query_schedules", "query_todos",
+        "reschedule_schedule", "search_documents",
     ]
     schemas = {item["function"]["name"]: item["function"]["parameters"] for item in openai_tools()}
     assert all(item.get("additionalProperties") is False for item in schemas.values())
@@ -623,3 +625,122 @@ def test_intent_node_scans_relative_time_when_llm_omits_it(monkeypatch):
     result = nodes.intent_node({"user_input": "看看我明天有哪些待办", "messages": []})
     assert result["context_window"]["start"].startswith("2026-11-24")
     assert result["user_intent"]["time_expressions"] == {"context_start": "明天"}
+
+
+# ---------- ug1 / Bug6 / ug7 验收用例 ----------
+
+def test_ug1_fuzzy_period_returns_prefer_not_validation_error():
+    """ug1：「11月27日下午」应产出 prefer 结构，不再抛 ValidationError。"""
+    from app.utils.nl_time import parse_nl_time
+
+    parsed = parse_nl_time(
+        {"schedule_start": "11月27日下午"}, "reschedule", now=datetime(2026, 11, 23, 21, 0)
+    )
+    assert parsed.period_prefer is not None
+    assert parsed.period_prefer["type"] == "prefer"
+    assert parsed.period_prefer["date"] == "2026-11-27"
+    assert parsed.period_prefer["period"] == "afternoon"
+    # 模糊时段不写精确时间，避免下游 Pydantic 时间校验报错
+    assert parsed.target_time["schedule_start"] is None
+
+
+def test_ug1_period_bounds_mapping():
+    """ug1：时段映射 morning 08-12 / afternoon 13-18 / evening 18-21。"""
+    from app.utils.time_periods import PERIOD_BOUNDS
+
+    assert PERIOD_BOUNDS["morning"] == (8, 12)
+    assert PERIOD_BOUNDS["afternoon"] == (13, 18)
+    assert PERIOD_BOUNDS["evening"] == (18, 21)
+
+
+def test_ug1_reschedule_tool_registered_with_relaxed_time_args():
+    """ug1：独立改期工具已注册，target_date/period_prefer 不做严格时间校验。"""
+    from app.tools.registry import tool_names
+    from app.tools.schemas import RescheduleScheduleArgs
+
+    assert "reschedule_schedule" in tool_names()
+    args = RescheduleScheduleArgs.model_validate({
+        "schedule_id": 1, "target_date": "2026-11-27", "period_prefer": "afternoon",
+        "room_prefer": "12F-A301",
+    })
+    assert args.target_date == "2026-11-27"
+    assert args.period_prefer == "afternoon"
+
+
+def test_bug6_parse_delete_command_with_remark_text():
+    """Bug6：带备注长文本也能抓到 ID，并正确识别目标类型。"""
+    from app.graph.nodes import parse_delete_command
+    from app.planning.plan_models import ActionType
+
+    res = parse_delete_command("删除整理技术文档 ID:2")
+    assert res["action"] == ActionType.DELETE
+    assert res["target_id"] == 2
+    assert res["target_type"] == "todo"
+
+    res2 = parse_delete_command("取消明天的项目评审会议 ID：5")
+    assert res2["target_id"] == 5
+    assert res2["target_type"] == "schedule"
+
+    # 无显式 ID 不得误判
+    assert parse_delete_command("删除整理技术文档")["action"] is None
+    # 日期数字不得被当成 ID
+    assert parse_delete_command("删除11月27日的会议")["action"] is None
+
+
+def test_bug6_delete_intent_shortcuts_to_delete_confirm(monkeypatch):
+    """Bug6：删除语句在 Intent 节点短路到 delete_confirm，绝不进 create_todo。"""
+    import json as _json
+    from app.graph import nodes
+
+    class FakeLLM:
+        def chat(self, messages, tools=None):
+            # 即便 LLM 误判成 create_todo，确定性识别也必须覆盖它
+            return {"content": _json.dumps({
+                "category": "create", "intent_type": "create_todo", "summary": "创建删除待办",
+                "time_expressions": {}, "risk_level": "low", "needs_rag": False,
+            }, ensure_ascii=False)}
+
+    monkeypatch.setattr(nodes, "get_llm", lambda: FakeLLM())
+    result = nodes.intent_node({"user_input": "删除整理技术文档 ID:2", "messages": []})
+    assert result["route"] == "delete"
+    assert result["user_intent"]["category"] == "delete"
+    assert result["user_intent"]["intent_type"] == "delete_todo"
+    assert result["user_intent"]["target_id"] == 2
+    assert result["target_time"] == {}  # 不碰 TARGET_KEYS
+
+
+def test_bug6_delete_todo_is_soft_delete_and_filtered():
+    """Bug6：delete_todo 只置 is_deleted=True，不新增待办；查询默认过滤。"""
+    from datetime import datetime as dt
+    from app.models.database import SessionLocal
+    from app.models.entities import Todo
+    from app.models import repository
+
+    with SessionLocal() as s:
+        todo = Todo(title="测试-删除验证待办", due_time=dt(2026, 12, 1, 9, 0), status="pending")
+        s.add(todo)
+        s.commit()
+        tid = todo.id
+    record = repository.delete_todo(tid, reason="验收测试")
+    assert record["is_deleted"] is True
+    with SessionLocal() as s:
+        titles = [t.title for t in repository.list_todos()]
+        assert "测试-删除验证待办" not in titles
+        # 确认没有新增“删除 xxx”待办
+        assert not any("删除验证待办" in t and t != "测试-删除验证待办" for t in titles)
+        s.query(Todo).filter(Todo.id == tid).delete(synchronize_session=False)
+        s.commit()
+
+
+def test_ug7_delay_card_dedup_by_todo_id():
+    """ug7：同一 todo.id 重复出现时，延后卡片只渲染一次。"""
+    from app.graph.nodes import _dedup_todos
+
+    items = [
+        {"id": 1, "title": "A", "due_time": "2026-11-25T10:00:00"},
+        {"id": 1, "title": "A", "due_time": "2026-11-25T10:00:00"},
+        {"id": 2, "title": "B", "due_time": "2026-11-26T10:00:00"},
+    ]
+    deduped = _dedup_todos(items)
+    assert len(deduped) == 2
+    assert [x["id"] for x in deduped] == [1, 2]

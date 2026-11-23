@@ -22,6 +22,7 @@ from app.graph.nodes import (
     admin_node,
     confirm_node,
     conflict_resolve_node,
+    delete_confirm_node,
     context_node,
     degraded_confirm_node,
     evaluator_node,
@@ -43,8 +44,13 @@ def _route(state: AgentState) -> str:
 
 
 def _intent_route(state: AgentState) -> str:
-    """管理员/测试预置指令走独立分支，完全跳过时间解析与工具 Schema。"""
-    return "admin" if (state.get("user_intent") or {}).get("category") == "admin" else "context"
+    """管理员预置走 admin；删除动作走独立 HITL 分支；其余走 context。"""
+    category = (state.get("user_intent") or {}).get("category")
+    if category == "admin":
+        return "admin"
+    if category == "delete":
+        return "delete_confirm"
+    return "context"
 
 
 def _rag_route(state: AgentState) -> str:
@@ -57,6 +63,7 @@ def build_workflow():
     for name, node in (
         ("intent", intent_node),
         ("admin", admin_node),
+        ("delete_confirm", delete_confirm_node),
         ("context", context_node),
         ("rag", rag_node),
         ("rule_extractor", rule_extractor_node),
@@ -72,8 +79,15 @@ def build_workflow():
         workflow.add_node(name, node)
 
     workflow.set_entry_point("intent")
-    workflow.add_conditional_edges("intent", _intent_route, {"admin": "admin", "context": "context"})
+    workflow.add_conditional_edges(
+        "intent", _intent_route,
+        {"admin": "admin", "delete_confirm": "delete_confirm", "context": "context"},
+    )
     workflow.add_edge("admin", END)
+    # 删除确认：同意→execute（只做软删除），取消→respond
+    workflow.add_conditional_edges(
+        "delete_confirm", _route, {"execute": "execute", "respond": "respond"}
+    )
     workflow.add_conditional_edges("context", _rag_route, {"rag": "rag", "rule_extractor": "rule_extractor"})
     workflow.add_edge("rag", "rule_extractor")
     workflow.add_edge("rule_extractor", "planner")
@@ -125,6 +139,7 @@ def _initial_state(user_input: str, history: list[dict] | None) -> dict:
         },
         "context_window": {"start": None, "end": None},
         "target_time": {key: None for key in TARGET_KEYS},
+        "time_prefer": None,
         "context_bundle": {
             "window": {},
             "schedules": [],
@@ -245,5 +260,6 @@ def run_agent(
             "time_expressions": (result.get("user_intent") or {}).get("time_expressions", {}),
             "context_window": result.get("context_window", {}),
             "target_time": result.get("target_time", {}),
+            "time_prefer": result.get("time_prefer"),
         }
     return response

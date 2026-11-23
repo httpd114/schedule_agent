@@ -157,6 +157,31 @@ class DeleteScheduleArgs(ToolArgs):
     reason: str | None = Field(default=None, description="取消原因，可选")
 
 
+class RescheduleScheduleArgs(ToolArgs):
+    """独立改期工具入参：软删除原日程 + 创建新日程，原子事务完成。
+
+    target_date / period_prefer / room_prefer 承接 ug1 的 prefer 偏好原文语义，
+    不做 Pydantic 时间校验；真正的写入时间由 CSP 求出后填入 start_time/end_time。
+    """
+    schedule_id: int = Field(
+        gt=0,
+        validation_alias=AliasChoices("schedule_id", "id"),
+        description="要改期的原日程 ID",
+    )
+    target_date: str | None = Field(default=None, description="目标日期，如 2026-11-27")
+    period_prefer: Literal["morning", "afternoon", "evening"] | None = Field(
+        default=None, description="时段偏好：morning/afternoon/evening"
+    )
+    room_prefer: str | None = Field(default=None, description="偏好会议室，如 12F-A301")
+    start_time: TimeStr | None = Field(default=None, description="求解器确定的新开始时间 ISO 8601")
+    end_time: TimeStr | None = Field(default=None, description="求解器确定的新结束时间 ISO 8601")
+
+
+class DeleteTodoArgs(ToolArgs):
+    id: int = Field(gt=0, description="要删除的待办 ID；执行软删除（is_deleted=True），可后台找回")
+    reason: str | None = Field(default=None, description="删除原因，可选")
+
+
 def _field_names(model: type[ToolArgs]) -> dict[str, str]:
     """外部可传入的名字 -> 模型字段名，兼容 AliasChoices 中的旧名。"""
     mapping: dict[str, str] = {}
