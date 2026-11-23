@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>日程任务自动编排 Agent</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">A</div>
+        <div>
+          <div class="brand-name">Schedule Agent</div>
+          <div class="brand-sub">自然语言任务编排</div>
+        </div>
+      </div>
+
+      <div class="status">
+        <span class="status-dot"></span>
+        <span id="statusText">正在连接服务...</span>
+      </div>
+
+      <section class="side-section">
+        <h3>快捷提问</h3>
+        <div class="examples">
+          <button class="example" data-q="查一下我明天有哪些日程，还有哪些待办">查询明天日程与待办</button>
+          <button class="example" data-q="帮我创建一个后天上午10点的产品评审日程，并加一条会后发纪要的待办">串行创建日程 + 待办</button>
+          <button class="example" data-q="公司报销的审批额度和时限是怎样的？">检索报销制度要点</button>
+          <button class="example" data-q="记个待办：周五前提交差旅报销，高优先级">创建高优先级待办</button>
+          <button class="example" data-q="我无法参加下周一10点的周会，帮我推演几种方案">周会冲突：轻量方案推演</button>
+          <button class="example" data-q="下周四下午14:00–15:30 安排一场技术评审">中文时间区间解析</button>
+          <button class="example" data-q="11月26日14:00 15F-B205 会议室有人吗">查询会议室占用</button>
+        </div>
+      </section>
+
+      <section class="side-section">
+        <h3>已注册工具 <span id="toolCount" class="count">0</span></h3>
+        <ul id="toolList" class="tool-list"></ul>
+      </section>
+
+      <div class="side-footer">
+        <div>LangGraph · Function Calling</div>
+        <div>SQLAlchemy · RAG · 智谱 GLM</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1>日程任务自动编排 Agent</h1>
+          <p>一句话完成日程创建、待办查询与业务文档检索</p>
+        </div>
+        <button id="clearBtn" class="ghost-btn" type="button">清空对话</button>
+      </header>
+
+      <div id="chat" class="chat">
+        <div class="welcome">
+          <div class="welcome-mark">A</div>
+          <h2>今天需要安排什么？</h2>
+          <p>直接说出你的需求，Agent 会推演多套方案、校验冲突与制度约束，确认后才写入数据。界面只呈现结论与方案，不展示内部调试信息。</p>
+          <div class="welcome-chips">
+            <button class="chip" data-q="明天下午3点安排项目复盘会，地点 12F-A301">安排会议</button>
+            <button class="chip" data-q="我有哪些高优先级待办">查看待办</button>
+            <button class="chip" data-q="项目上线前需要完成哪些交付标准">查项目文档</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="composer-wrap">
+        <div class="composer">
+          <textarea id="input" rows="1" placeholder="例如：明天下午3点安排项目复盘会，并加一条会后发纪要的待办"></textarea>
+          <button id="sendBtn" type="button" aria-label="发送">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 2 11 13"></path><path d="M22 2 15 22 11 13 2 9 22 2"></path>
+            </svg>
+          </button>
+        </div>
+        <div class="hint">Enter 发送 · Shift + Enter 换行 · 高风险方案会先请你确认</div>
+      </div>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
