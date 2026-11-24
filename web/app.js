@@ -15,7 +15,11 @@ const TOOL_LABELS = {
   create_todo: "创建待办",
   query_todos: "查询待办",
   search_documents: "文档检索",
-  delete_schedule: "取消日程（软删除）",
+  delete_schedule: "取消日程",
+  delete_todo: "删除待办",
+  reschedule_schedule: "日程改期",
+  apply_leave: "请假安排",
+  check_room_occupancy: "会议室查询",
   aggregate_context: "上下文聚合",
 };
 
@@ -38,22 +42,48 @@ function inline(text) {
     .replace(/`([^`]+)`/g, "<code>$1</code>");
 }
 
+// 判定一条列表项是否为待办/任务条目（含截止时间或优先级描述）
+function isTaskLine(text) {
+  return /截止|优先级|距离现在|高优先/.test(text);
+}
+
+// 把待办条目渲染成独立卡片：高优打橙色标签，截止时间高亮
+function taskLi(text) {
+  const high = /高优先|高优先级|P0|P1/i.test(text);
+  const tag = high ? '<span class="priority-tag">高优先</span>' : "";
+  let body = inline(text);
+  body = body.replace(/(截止(?:到|时间)?[:：]\s*[^（(<]+)/g, '<span class="task-due">$1</span>');
+  return `<li class="task-card${high ? " high-priority" : ""}">${tag}${body}</li>`;
+}
+
 function renderMarkdown(text) {
   const lines = String(text || "").split(/\r?\n/);
   let html = "";
-  let listType = null;
-  let items = [];
+  let listTag = null;   // "ul" | "ol"
+  let listClass = "";   // "task-list" 或空
+  let items = [];       // 每项为完整的 <li>...</li>
 
   const flush = () => {
     if (!items.length) return;
-    html += `<${listType}>` + items.map((item) => `<li>${item}</li>`).join("") + `</${listType}>`;
+    const cls = listClass ? ` class="${listClass}"` : "";
+    html += `<${listTag}${cls}>` + items.join("") + `</${listTag}>`;
     items = [];
-    listType = null;
+    listTag = null;
+    listClass = "";
   };
 
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) { flush(); continue; }
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) {
+      // 列表项之间的空行不打断列表，否则多个 <ol> 会让编号全部从 1 开始
+      let j = i + 1;
+      while (j < lines.length && !lines[j].trim()) j++;
+      const next = j < lines.length ? lines[j].trim() : "";
+      if ((listTag === "ol" && /^\d+\.\s+/.test(next)) ||
+          (listTag === "ul" && /^[-*]\s+/.test(next))) continue;
+      flush();
+      continue;
+    }
 
     let match = line.match(/^(#{1,4})\s+(.*)$/);
     if (match) {
@@ -64,16 +94,20 @@ function renderMarkdown(text) {
     }
     match = line.match(/^[-*]\s+(.*)$/);
     if (match) {
-      if (listType && listType !== "ul") flush();
-      listType = "ul";
-      items.push(inline(match[1]));
+      const task = isTaskLine(match[1]);
+      if (listTag && (listTag !== "ul" || !!listClass !== task)) flush();
+      listTag = "ul";
+      listClass = task ? "task-list" : "";
+      items.push(task ? taskLi(match[1]) : `<li>${inline(match[1])}</li>`);
       continue;
     }
-    match = line.match(/^\d+\.\s+(.*)$/);
+    match = line.match(/^(\d+)\.\s+(.*)$/);
     if (match) {
-      if (listType && listType !== "ol") flush();
-      listType = "ol";
-      items.push(inline(match[1]));
+      if (listTag && listTag !== "ol") flush();
+      listTag = "ol";
+      listClass = "";
+      // 保留原文序号，即使列表被标题等内容打断也不会重置为 1
+      items.push(`<li value="${match[1]}">${inline(match[2])}</li>`);
       continue;
     }
     flush();
@@ -232,7 +266,7 @@ async function loadMeta() {
     statusDot.classList.add("online");
     toolCount.textContent = String(health.tools.length);
     toolList.innerHTML = health.tools
-      .map((name) => `<li><code>${escapeHtml(name)}</code> · ${escapeHtml(TOOL_LABELS[name] || name)}</li>`)
+      .map((name) => `<li title="${escapeHtml(name)}">${escapeHtml(TOOL_LABELS[name] || name)}</li>`)
       .join("");
   } catch (error) {
     statusText.textContent = "服务连接失败";
